@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msforms-mcp"
+version = "0.1.0"
+description = "Browser-authenticated Microsoft Forms authoring over MCP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.3,<3", "playwright>=1.63,<2", "openpyxl>=3.1.5,<4"]
+
+[project.scripts]
+msforms-mcp = "forms_mcp.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forms_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["live: opt-in tests that mutate disposable Microsoft Forms"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

@@ -1,0 +1,10 @@
+{
+  "title": "Equipment evaluation",
+  "spec": [
+    {"s": "Identification"},
+    {"k": "reference", "t": "Text", "q": "Reference number", "req": true, "long": false},
+    {"s": "Evaluation"},
+    {"k": "comments", "t": "Text", "q": "Additional Comments"},
+    {"k": "accepted", "t": "Choice", "q": "Accepted", "opts": ["Yes", "No"], "req": true}
+  ]
+}
