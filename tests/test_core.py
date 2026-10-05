@@ -267,6 +267,71 @@ async def test_fleet_stale_count_and_decline_produce_zero_writes(tmp_path):
     api.request.assert_not_called()
 
 
+class FakePage:
+    """Returns each queued response in turn, recording how many calls happened."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+
+    async def evaluate(self, _script, _arg=None):
+        self.calls += 1
+        return self.replies.pop(0)
+
+
+def fake_api(replies):
+    session = SimpleNamespace(page=FakePage(replies), pace=AsyncMock(), lock=None)
+    return FormsAPI(session), session.page
+
+
+@pytest.mark.parametrize(
+    "throttle",
+    [
+        {"status": 429, "data": None, "retryAfter": "0"},
+        {"status": 503, "data": None, "retryAfter": None},
+        {"status": 403, "data": None, "retryAfter": None},  # throttle, HTML body
+    ],
+)
+async def test_throttled_requests_are_retried(monkeypatch, throttle):
+    monkeypatch.setattr("forms_mcp.api.BACKOFF", 0)
+    api, page = fake_api([throttle, throttle, {"status": 200, "data": {"ok": True}}])
+    result = await api.request("GET", "https://forms.cloud.microsoft/formapi/api/x")
+    assert result["data"] == {"ok": True}
+    assert page.calls == 3
+
+
+async def test_a_real_403_rejection_is_not_retried(monkeypatch):
+    monkeypatch.setattr("forms_mcp.api.BACKOFF", 0)
+    api, page = fake_api(
+        [{"status": 403, "data": {"error": {"code": "denied"}}, "retryAfter": None}]
+    )
+    with pytest.raises(FormsError, match="403"):
+        await api.request("GET", "https://forms.cloud.microsoft/formapi/api/x")
+    assert page.calls == 1
+
+
+async def test_sustained_throttle_reports_rate_limiting(monkeypatch):
+    monkeypatch.setattr("forms_mcp.api.BACKOFF", 0)
+    api, page = fake_api([{"status": 429, "data": None, "retryAfter": None}] * 6)
+    with pytest.raises(FormsError, match="rate limited"):
+        await api.request("PATCH", "https://forms.cloud.microsoft/formapi/api/x", {"title": "x"})
+    assert page.calls == 6
+
+
+async def test_fleet_plan_reuses_discovery_reads(tmp_path):
+    api = SimpleNamespace(
+        forms={FID: form()},
+        read=AsyncMock(side_effect=AssertionError("planning must not re-read discovered forms")),
+        list_forms=AsyncMock(return_value={"complete": True, "forms": [{"id": FID}]}),
+        session=SimpleNamespace(identity=AsyncMock(return_value={"owner": "u", "tenant": "t"})),
+    )
+    plan = await Fleet(api, SimpleNamespace(), tmp_path).plan(
+        {"all_editable": True},
+        [{"action": "patch", "title": "Comments", "changes": {"title": "N"}}],
+    )
+    assert plan["forms"][0]["status"] == "planned"
+
+
 def test_redaction_and_fingerprint():
     assert redact(
         {"permissionTokens": ["secret"], "questions": [{"title": "X", "cookie": "secret"}]}

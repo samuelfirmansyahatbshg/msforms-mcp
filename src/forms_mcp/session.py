@@ -46,6 +46,7 @@ class BrowserSession:
         self.runtime = None
         self.lock = asyncio.Lock()
         self.last_write = 0.0
+        self.min_interval = float(os.environ.get("FORMS_MCP_MIN_INTERVAL", "0.35"))
 
     async def start(self):
         if self.context:
@@ -118,8 +119,14 @@ class BrowserSession:
         }""")
 
     async def pace(self):
+        """Minimum spacing between every Forms request, reads included.
+
+        120 ms is the measured-safe figure for writes, but a burst of ~50 full-form reads
+        (an account-wide fleet plan) earns a sustained 429, so the default is gentler and
+        tunable. Lower it only for small, known-size runs.
+        """
         loop = asyncio.get_running_loop()
-        await asyncio.sleep(max(0, 0.12 - (loop.time() - self.last_write)))
+        await asyncio.sleep(max(0, self.min_interval - (loop.time() - self.last_write)))
         self.last_write = loop.time()
 
     async def close(self):

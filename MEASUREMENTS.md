@@ -141,6 +141,34 @@ A submit whose confirmation is lost is reported as `uncertain` and **never repla
   `already_applied` with no second mutation; a **fresh** plan with the same edits reported
   `unmatched` rather than claiming the edit had been applied.
 
+## Rate limiting — hit, not theorised (2026-10-05)
+
+Renaming one card across 27 forms in a real account tripped Forms' throttle. What was
+observed:
+
+- The sequence that caused it: a 52-form scan (two full reads each), then two
+  account-wide `forms_fleet_plan` runs, each of which read all 52 forms again — roughly
+  400 requests in half an hour.
+- The response is **HTTP 429**, first on the per-form `$expand` reads and, at its peak, on
+  the collection endpoints (`light/forms`, `groups`, `sharedWithMeForms`) as well. No
+  `Retry-After` header was returned.
+- It is **not** momentary: short retries (1.5s × 4) never outlasted it, and the Forms *web
+  UI* showed "We're having trouble accessing your forms" for the same account while it
+  lasted. It cleared on its own in well under an hour with no action taken.
+- Nothing was corrupted. Throttled writes simply did not happen, which is why retrying
+  them is safe.
+
+Consequences now in the code: every request is paced (`FORMS_MCP_MIN_INTERVAL`, default
+350 ms, reads included); 429, 503 and HTML-bodied 403 are retried with 4s doubling to 64s
+over 6 attempts; `forms_fleet_plan` reuses discovery's reads instead of reading every form
+a second time. Even so, **target ids and work in chunks** for anything fleet-wide — an
+account-wide sweep is the shape that earns a throttle.
+
+A separate failure worth recording: the visible automation browser was closed by hand
+mid-run twice. Writes in flight surfaced as `uncertain_result`, were **not** marked done,
+and the fleet journal reconciled them against each operation's predicted fingerprint on
+resume rather than writing twice.
+
 ## Still unmeasured — do not build on these without probing
 
 - Writing to a **group-owned or shared** form (discovery works; the group write path is untested).
@@ -149,6 +177,5 @@ A submit whose confirmation is lost is reported as `uncertain` and **never repla
 - Branching forms, and any form whose answers reveal later pages conditionally.
 - Whether a stored, already-synced workbook keeps a deleted question's column — the
   measurement above is of fresh exports, and the stored file's cells are 403 here.
-- Rate-limit behaviour under sustained bursts: writes are paced ≥120 ms and no
-  "changes were not saved" banner appeared in these runs, so the limit itself was never hit.
+- Whether the limit in "Rate limiting" below is per minute, per hour or per request type.
 - Any tenant whose Forms UI is not in English: several waits key on `Submit`/`Next` names.

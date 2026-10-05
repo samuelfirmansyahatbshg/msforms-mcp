@@ -9,6 +9,9 @@ from urllib.parse import urljoin, urlsplit
 from .errors import FormsError
 from .ids import ORIGIN, api_root
 
+ATTEMPTS = 6
+BACKOFF = 4.0  # seconds; doubles per attempt, so ~4+8+16+32+64 before giving up
+
 
 def script(name: str) -> str:
     return files("forms_mcp").joinpath("js", name).read_text(encoding="utf-8")
@@ -29,6 +32,7 @@ def redact(value):
 class FormsAPI:
     def __init__(self, session):
         self.session = session
+        self.forms = {}  # last list_forms() snapshot, keyed by form id
 
     async def request(self, method: str, url: str, body=None, *, allow_missing=False):
         parts = urlsplit(url)
@@ -38,9 +42,8 @@ class FormsAPI:
             or not parts.path.startswith("/formapi/")
         ):
             raise FormsError("unsafe_endpoint", "Refused request outside the Forms origin.")
-        for attempt in range(4):
-            if method != "GET":
-                await self.session.pace()
+        for attempt in range(ATTEMPTS):
+            await self.session.pace()
             try:
                 result = await self.session.page.evaluate(
                     script("request.js"), {"url": url, "method": method, "body": body}
@@ -59,16 +62,27 @@ class FormsAPI:
                     "!!window.OfficeFormServerInfo?.antiForgeryToken"
                 )
                 continue
-            if method == "GET" and status in (429, 503) and attempt < 3:
+            # Measured 2026-10-05: a sweep over ~50 forms earns a sustained 429 that
+            # short retries do not outlast. A throttle also appears as 403 with an HTML
+            # body, where a real rejection is JSON. Retrying is safe for writes too:
+            # a throttled request was refused, so it had no effect.
+            throttled = status in (429, 503) or (status == 403 and result["data"] is None)
+            if throttled and attempt < ATTEMPTS - 1:
                 try:
-                    delay = float(result.get("retryAfter") or 1.5 * 2**attempt)
-                except ValueError:
-                    delay = 1.5 * 2**attempt
-                await asyncio.sleep(min(max(delay, 0.12), 60))
+                    delay = float(result.get("retryAfter") or 0)
+                except (TypeError, ValueError):
+                    delay = 0
+                await asyncio.sleep(min(max(delay, BACKOFF * 2**attempt), 120))
                 continue
             raise FormsError(
                 f"http_{status}",
-                f"Forms {method} returned HTTP {status}. No response body or credentials logged.",
+                f"Forms {method} returned HTTP {status}"
+                + (
+                    " (rate limited; wait a few minutes and retry with fewer forms per run)"
+                    if throttled
+                    else ""
+                )
+                + ". No response body or credentials logged.",
             )
 
     async def prepare(self, form_id=None):
@@ -147,11 +161,16 @@ class FormsAPI:
         except (FormsError, ValueError) as exc:
             errors.append({"source": "groups", "message": str(exc)})
         result = []
+        # One full read per form, cached on `forms` for the caller (fleet planning needs
+        # the cards and must not read all of them a second time: measured, a double sweep
+        # over ~50 forms is enough to earn a sustained 429).
+        self.forms = {}
         for fid, item in found.items():
             if title_filter.casefold() not in str(item.get("title", "")).casefold():
                 continue
             try:
                 form = await self.read(fid)
+                self.forms[fid] = form
                 result.append(
                     {
                         "id": fid,

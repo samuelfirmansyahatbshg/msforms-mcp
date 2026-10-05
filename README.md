@@ -86,6 +86,14 @@ state drifted since the plan, journals its progress so an interrupted run resume
 of repeating writes, continues across independent per-form failures, and reports what
 succeeded, what was skipped and what failed.
 
+### Rate limits
+
+Forms throttles with `429` under sustained sweeps — measured, see `MEASUREMENTS.md`. Every
+request is paced (`FORMS_MCP_MIN_INTERVAL`, default 350 ms) and throttles are retried with
+backoff, but an account-wide plan over dozens of forms is the shape that earns one, and
+while it lasts the Forms web UI reports "We're having trouble accessing your forms" too.
+For large fleets prefer an explicit `ids` selector in chunks over `all_editable`.
+
 ## What the dangerous paths do
 
 **Deleting a question destroys every past response's answer to it** — measured, see

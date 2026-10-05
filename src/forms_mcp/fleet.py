@@ -113,6 +113,7 @@ class Fleet:
                 raise FormsError("invalid_edit", "Patch edits require a changes object.")
             if edit["action"] == "delete" and "changes" in edit:
                 raise FormsError("invalid_edit", "Delete edits cannot include changes.")
+        cached = {}
         if "ids" in selector:
             if (
                 not isinstance(selector["ids"], list)
@@ -137,10 +138,14 @@ class Fleet:
                     "Account discovery is incomplete; use explicit IDs or resolve discovery errors.",
                 )
             ids = [f["id"] for f in discovery["forms"]]
+            # Discovery already read each of these; re-reading them all is what trips the
+            # rate limit. Apply re-reads every form before writing anyway, so a plan built
+            # from the discovery snapshot is no less safe.
+            cached = self.api.forms
         forms = []
         for fid in ids:
             try:
-                forms.append(plan_form(await self.api.read(fid), edits))
+                forms.append(plan_form(cached.get(fid) or await self.api.read(fid), edits))
             except FormsError as exc:
                 forms.append({"form_id": fid, "status": "blocked", "reason": str(exc)})
         # Planning writes no files and mutates no Forms state.
