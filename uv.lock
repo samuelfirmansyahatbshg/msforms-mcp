@@ -459,9 +459,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.26,<3" },
+    { name = "mcp", specifier = ">=2.3,<3" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },
-    { name = "playwright", specifier = ">=1.58,<2" },
+    { name = "playwright", specifier = ">=1.63,<2" },
 ]
 
 [package.metadata.requires-dev]
