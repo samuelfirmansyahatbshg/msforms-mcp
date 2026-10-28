@@ -55,13 +55,26 @@ per card, in the order the form should read — see [`examples/`](examples/):
 ```json
 [{"s": "Evaluation"},
  {"k": "comments", "t": "Text", "q": "Additional Comments"},
- {"k": "accepted", "t": "Choice", "q": "Accepted", "opts": ["Yes", "No"], "req": true}]
+ {"k": "accepted", "t": "Choice", "q": "Accepted", "opts": ["Yes", "No"], "req": true},
+ {"k": "taste", "t": "Rating", "q": "Taste", "levels": 10, "shape": "Number",
+  "left": "Poor", "right": "Excellent"},
+ {"k": "baked", "t": "Date", "q": "Baked on"},
+ {"k": "order", "t": "Ranking", "q": "Rank these", "opts": ["Crust", "Crumb", "Colour"]},
+ {"k": "nps", "t": "NPS", "q": "Would you recommend it"}]
 ```
 
-`s` a section · `t` one of `Text`/`Choice`/`Upload` · `q` the title · `req` required ·
-`num` number validation · `long: false` opts a text box out of the long-answer default ·
-`opts` the exact option strings · `mb` an upload size limit · `k` your own key, echoed back
-with the created card's id. Choice options must be listed explicitly.
+`s` a section · `t` one of `Text`/`Choice`/`Upload`/`Rating`/`Date`/`Ranking`/`NPS` · `q`
+the title · `req` required · `num` number validation · `long: false` opts a text box out of
+the long-answer default · `opts` the exact option strings for `Choice` and `Ranking` · `mb`
+an upload size limit · `levels` 2-10 and `shape` (`Star`, `Number`, `Heart`, `Flag`,
+`ThumbLike`, `SmileFace`, `Lightbulb`) for `Rating` · `left`/`right` the
+end labels of a `Rating` or `NPS` · `k` your own key, echoed back with the created card's
+id. Choice and Ranking options must be listed explicitly.
+
+Likert **creation is not supported**: an existing one inspects as a `Likert` card plus one
+`LikertRow` per statement carrying `group_id`. Existing Likert column options can be patched;
+creating its composite group and rows is not part of the spec contract.
+`forms_fill` still answers only Text, Choice and Upload.
 
 `forms_build` is idempotent: a card whose exact title and type already exist in position is
 skipped, repeated titles are matched in order against a queue, and a run that died partway
@@ -85,6 +98,11 @@ guessed at. Planning writes nothing. Applying re-reads each form first and skips
 state drifted since the plan, journals its progress so an interrupted run resumes instead
 of repeating writes, continues across independent per-form failures, and reports what
 succeeded, what was skipped and what failed.
+
+Ranking and Likert option patches use the same sub-collection operations as individual
+patches. Their ordered option text participates in drift checks and journal reconciliation.
+If interrupted partway through a multi-request patch, a partially changed form is refused
+as stale rather than treated as completed; inspect it before making a new plan.
 
 ### Rate limits
 
@@ -110,10 +128,15 @@ For large fleets prefer an explicit `ids` selector in chunks over `all_editable`
 
 An export preserves the data; it does **not** restore deleted answers into Forms.
 
-**A question's type cannot be changed.** Forms has no such operation, and text → choice
-means delete and recreate, so `forms_patch_question` refuses rather than doing that
-silently. Title, required, options, `Multiline` and the upload size limit patch in place,
-preserving unknown `questionInfo` fields so a new Forms property survives a round trip.
+**Type conversion is not supported.** No conversion control was found in the measured
+text-question editor. `forms_patch_question` refuses type changes rather than implicitly
+deleting and recreating a question and risking historical answers.
+Title, required, options, `Multiline`, the upload size limit, a Rating's `levels`
+and `shape` and a Rating's or NPS's `left`/`right` labels patch in place, preserving unknown
+`questionInfo` fields so a new Forms property survives a round trip. Ranking and Likert
+options are not in `questionInfo`: patching them renames, appends and deletes entries of the
+measured `choices` sub-collection. What a deleted option does to answers already submitted
+against it is **unmeasured**; back the form up first.
 
 **Moving a card breaks the workbook correspondence.** The response workbook's column order
 is creation order, and consumers map columns by position. Moving a card rewrites its
@@ -122,12 +145,18 @@ time, and whole order values afterwards do **not** prove the columns still line 
 `forms_inspect` reports fractional orders and untitled orphans for the same reason.
 
 **The workbook is diagnosed, not guessed.** `forms_workbook_status` resolves the associated
-workbook and reports rows, columns, surplus and missing columns versus live questions —
-except that reading a stored workbook's cells returns 403 through the browser in the tenant
-measured, in which case it reports those counts as unknown with a warning instead of
-substituting a fresh export's shape. `forms_provision_workbook` checks for an existing
-association first; if a first response is genuinely needed it previews the synthetic
-answers, asks, and discloses that the synthetic response stays in the form.
+workbook and reports rows, columns, surplus and missing columns versus live questions. The
+Excel REST surface is denied in the tenant measured (`403 OpenWorkbookAccessDenied`), so it
+falls back to downloading the stored file from its own SharePoint site, establishing the
+site session through browser SSO when needed. Downloads are restricted to HTTPS
+`*.sharepoint.com` sites and do not follow redirects. `freshness` then reads `stored_file`;
+only a file it cannot fetch leaves the counts `null` with `freshness: "unknown"`. A
+**stored workbook keeps
+a deleted question's column** while a fresh export drops it, so a non-zero
+`surplus_columns` is normal after a delete and is reported rather than smoothed over.
+`forms_provision_workbook` checks for an existing association first; if a first response is
+genuinely needed it previews the synthetic answers, asks, and discloses that the synthetic
+response stays in the form.
 
 ## Testing
 
@@ -137,7 +166,8 @@ uv run pytest                 # offline: unit, injected-JS (needs node), stdio d
 uv run ruff check src tests scripts
 ```
 
-The offline suite covers the GUID decode, the measured `questionInfo` payloads, order
+The offline suite covers the GUID decode, the measured `questionInfo` payloads for every
+supported type, the Ranking option diff against a live `choices` sub-collection, order
 arithmetic, repeated and ambiguous titles, stale plans, interrupted-apply reconciliation,
 the false `A1:A1` export dimension, redaction, and — asserting on the call not happening —
 that a declined gate or a failed backup never reaches a delete.
@@ -146,7 +176,8 @@ that a declined gate or a failed backup never reaches a delete.
 FORMS_MCP_LIVE=1 FORMS_MCP_PROFILE=~/.forms-mcp/browser-profile uv run pytest -m live
 ```
 
-The live test creates its own disposable form, runs create → build → verify → patch →
+The live test creates its own disposable form, runs create → build (Text, Choice, Rating,
+Date, Ranking, NPS) → verify → patch (text, ranking options, rating levels and shape) →
 no-op rebuild → submit → provision → status → backup → gated delete → delete form, and
 mutates nothing else.
 

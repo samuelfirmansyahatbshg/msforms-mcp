@@ -5,7 +5,7 @@ import json
 
 from .errors import FormsError
 from .ids import api_root
-from .operations import cards, find_card
+from .operations import CHOICE_SUBCOLLECTION, card_options, cards, find_card
 
 
 def fingerprint(form):
@@ -14,7 +14,22 @@ def fingerprint(form):
         "title": form.get("title"),
         "rowCount": form.get("rowCount"),
         "cards": [
-            {k: c.get(k) for k in ("id", "type", "title", "order", "required", "questionInfo")}
+            {
+                **{
+                    k: c.get(k)
+                    for k in (
+                        "id",
+                        "type",
+                        "title",
+                        "order",
+                        "required",
+                        "questionInfo",
+                        "groupId",
+                        "allowMultipleValues",
+                    )
+                },
+                **({"options": card_options(c)} if c["type"] in CHOICE_SUBCOLLECTION else {}),
+            }
             for c in cards(form)
         ],
     }
@@ -81,7 +96,12 @@ async def delete(
     if card_id:
         after = await api.read(form_id)
         remaining = {c["id"] for c in cards(after)}
-        expected = {c["id"] for c in cards(before)} - {card_id}
+        expected = {
+            c["id"]
+            for c in cards(before)
+            if c["id"] != card_id
+            and not (card["type"] == "Question.MatrixChoiceGroup" and c.get("groupId") == card_id)
+        }
         verified = remaining == expected
     else:
         check = await api.request(

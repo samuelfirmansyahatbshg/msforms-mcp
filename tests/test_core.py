@@ -10,7 +10,7 @@ from forms_mcp.api import FormsAPI, redact
 from forms_mcp.errors import FormsError
 from forms_mcp.fleet import Fleet, plan_form
 from forms_mcp.ids import api_root, decode_form_id
-from forms_mcp.operations import move_order, patch_payload
+from forms_mcp.operations import card_options, choice_ops, move_order, patch_payload
 from forms_mcp.safety import delete, fingerprint
 from forms_mcp.server import confirmed
 from forms_mcp.spec import validate_spec
@@ -68,6 +68,13 @@ def test_invalid_form_ids(value):
         {"t": "Text", "q": "Q", "req": "false"},
         {"t": "Upload", "q": "Q", "mb": True},
         {"t": "Text", "q": "Q", "opts_from": "TABLE"},
+        {"t": "Likert", "q": "Q", "opts": ["a", "b"]},
+        {"t": "Rating", "q": "Q", "levels": 1},
+        {"t": "Rating", "q": "Q", "shape": "Sparkle"},
+        {"t": "Ranking", "q": "Q"},
+        {"t": "NPS", "q": "Q", "levels": 5},
+        {"t": "Choice", "q": "Q", "opts": ["Yes"], "left": "Low"},
+        {"t": "Date", "q": "Q", "opts": ["Yes"]},
     ],
 )
 def test_invalid_specs(card):
@@ -91,6 +98,79 @@ def test_patch_preserves_unknown_info_and_refuses_type_change():
     }
     with pytest.raises(FormsError, match="cannot change"):
         patch_payload(c, {"type": "Choice"})
+
+
+def rating_card():
+    return {
+        "id": QID,
+        "title": "Service",
+        "type": "Question.Rating",
+        "questionInfo": '{"Length":5,"RatingShape":"Star","LeftDescription":"",'
+        '"RightDescription":"","MinRating":1,"FutureProperty":7}',
+    }
+
+
+def ranking_card(texts=("Alpha", "Beta", "Gamma")):
+    return {
+        "id": QID,
+        "title": "Order these",
+        "type": "Question.Ranking",
+        "questionInfo": '{"ShuffleOptions":false}',
+        "choices": [{"id": i + 1, "order": i + 1, "displayText": t} for i, t in enumerate(texts)],
+    }
+
+
+def test_rating_patch_keeps_unknown_info_and_guards_its_fields():
+    card = rating_card()
+    payload = patch_payload(card, {"levels": 7, "shape": "SmileFace", "left": "Low"})
+    assert json.loads(payload["questionInfo"]) == {
+        "Length": 7,
+        "RatingShape": "SmileFace",
+        "LeftDescription": "Low",
+        "RightDescription": "",
+        "MinRating": 1,
+        "FutureProperty": 7,
+    }
+    for change in ({"levels": 11}, {"shape": "Sparkle"}):
+        with pytest.raises(FormsError, match="invalid_patch|must be"):
+            patch_payload(card, change)
+    with pytest.raises(FormsError, match="only to Rating"):
+        patch_payload(form()["questions"][0], {"levels": 5})
+    with pytest.raises(FormsError, match="Rating and NPS"):
+        patch_payload(form()["questions"][0], {"left": "Low"})
+
+
+def test_ranking_options_bypass_question_info_and_diff_against_live_choices():
+    card = ranking_card()
+    # Options live in the sub-collection, so the question itself has nothing to patch.
+    assert patch_payload(card, {"options": ["Alpha", "Beta", "Gamma"]}) == {}
+    card["choices"][2]["order"] = 9
+    ops = choice_ops(card, ["Alpha", "Delta", "Gamma", "Epsilon"])
+    assert [(method, path) for method, path, _ in ops] == [
+        ("PATCH", "/choices(2)"),
+        ("POST", "/choices"),
+    ]
+    assert ops[0][2]["displayText"] == "Delta"
+    # A new option must sort after the highest live order, not after its index.
+    assert ops[1][2]["order"] == 10
+    assert [(method, path) for method, path, _ in choice_ops(card, ["Alpha"])] == [
+        ("DELETE", "/choices(2)"),
+        ("DELETE", "/choices(3)"),
+    ]
+    card["choices"][0]["id"] = "1"
+    with pytest.raises(FormsError, match="unknown_choice_shape|integers"):
+        choice_ops(card, ["Alpha"])
+
+
+def test_card_options_read_from_each_types_own_store():
+    assert card_options(ranking_card()) == ["Alpha", "Beta", "Gamma"]
+    assert card_options(
+        {
+            "type": "Question.Choice",
+            "questionInfo": '{"Choices":[{"Description":"Yes"},{"Description":"No"}]}',
+            "choices": [],
+        }
+    ) == ["Yes", "No"]
 
 
 def test_move_arithmetic_and_unknown_neighbor():
@@ -339,3 +419,19 @@ def test_redaction_and_fingerprint():
     changed = form()
     changed["questions"][0]["required"] = True
     assert fingerprint(form()) != fingerprint(changed)
+
+
+async def test_ranking_options_changed_during_confirmation_refuse_delete(tmp_path):
+    before = form()
+    before["rowCount"] = 0
+    before["questions"] = [ranking_card()]
+    after = deepcopy(before)
+    after["questions"][0]["choices"][0]["displayText"] = "Changed during confirmation"
+    api = SimpleNamespace(
+        read=AsyncMock(side_effect=[before, after]),
+        request=AsyncMock(),
+        card_path=FormsAPI.card_path,
+    )
+    with pytest.raises(FormsError, match="changed after confirmation"):
+        await delete(api, SimpleNamespace(), AsyncMock(return_value=True), FID, QID)
+    api.request.assert_not_called()

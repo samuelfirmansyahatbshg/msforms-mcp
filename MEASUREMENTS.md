@@ -64,6 +64,79 @@ The UI's create payload, which `forms_create` reproduces:
 `settings` is a JSON **string**; `progressBarEnabled` is the string `"false"`. The two
 ownership fields are read from the live session, never from a fixture.
 
+## Question types beyond Text, Choice and Upload (2026-10-27)
+
+Measured in one disposable form on `forms.cloud.microsoft`, in the same tenant. Each type
+was first created in the real designer and read back through the API. Selected designer
+writes (including choice creation and Rating changes) were captured using an instrumented
+`XMLHttpRequest`/`fetch`. Rating, Date, Ranking and NPS were then built through this package.
+
+| UI type | API `type` | `questionInfo` as the designer writes it |
+|---|---|---|
+| Rating | `Question.Rating` | `{"Length":5,"RatingShape":"Star","LeftDescription":"","RightDescription":"","MinRating":1}` |
+| Date | `Question.DateTime` | `{"Date":true,"Time":false,"ShuffleOptions":false,"IsMathQuiz":false}` |
+| Ranking | `Question.Ranking` | `{"ShuffleOptions":false,"ShowRatingLabel":false,"IsMathQuiz":false}`, plus `allowMultipleValues: true` |
+| Likert | `Question.MatrixChoiceGroup` | same as Ranking, plus one `Question.MatrixChoice` card per statement |
+| Net Promoter Score | `Question.NPS` | `{"LeftDescription":"Not at all likely","RightDescription":"Extremely likely","ShuffleOptions":false,"ShowRatingLabel":false,"IsMathQuiz":false}` |
+
+`RatingShape` is the UI label with its spaces removed. Measured by selecting them:
+`Star`, `Number`, `Heart`, `Flag`, `ThumbLike`, `SmileFace`, `Lightbulb`. `Ribbon` and
+`Trophy` are offered by the same dropdown but were not observed on the wire. The Levels
+dropdown offers 2 through 10 and writes `Length`.
+
+### Options are a sub-collection for Ranking and Likert
+
+Choice keeps its options in `questionInfo.Choices`, confirmed again from a designer-created
+Choice card. Ranking and Likert do not: their options are a separate collection, and
+sending `choices` inline on the question (`POST` or `PATCH`) is rejected **400 "The input
+was not valid."**
+
+| Request | Result |
+|---|---|
+| `POST …/questions('{q}')/choices` `{displayText, order, description, key, customProperties}` | 201, server assigns the integer `id` |
+| `PATCH …/questions('{q}')/choices({n})` `{displayText, customProperties}` | 204 |
+| `DELETE …/questions('{q}')/choices({n})` | 204 |
+
+The designer POSTs a generated option and then PATCHes the typed text; posting the final
+text directly is accepted the same way, which is what `forms_build` and
+`forms_patch_question` do. `customProperties` is itself a JSON **string**:
+`{"IsGenerated":true}` while untouched, `{"FormsProDisplayRTText":"<text>"}` once named.
+Option `order` values are not reindexed on edit, so a form can hold `1,2,9`; new options
+must sort after the live maximum, not after their position.
+
+### Likert is one card plus one card per statement
+
+Creating a Likert writes, in order: the `Question.MatrixChoiceGroup`, then one
+`Question.MatrixChoice` per statement carrying `groupId: "<group id>"` and **no**
+`questionInfo`, then one `choices` POST per column option against the group.
+`DELETE …/questions('<group>')` returned 204 and **took its statement rows with it**,
+unlike a section, whose questions survive. This package reads Likert as `Likert` plus
+`LikertRow` with `group_id` and patches its existing column options, but does not create
+new Likert composites through the declarative spec.
+
+### End-to-end, through this package
+
+`tests/test_live.py` builds Rating (`levels: 10`, `shape: Number`, labels), Date, Ranking
+and NPS alongside Text and Choice, verifies the reread, patches Ranking options through a
+fleet plan (including replay reconciliation), then removes surplus options individually.
+It patches Rating levels and shape, re-runs the build as a no-op, submits a response,
+exports the workbook and deletes a question behind the gate. Each new type occupies one
+export column. Responder controls for all four types were also inspected in the real
+response page, including a seven-level SmileFace rating and custom NPS endpoint labels.
+
+A separate disposable-form smoke exercised existing Likert column options through a fleet
+plan, replayed it without a second mutation, and verified a gated group deletion removed
+both the group and its statement row. Passed 2026-10-27.
+
+Responder support is unchanged: `forms_fill` answers Text, Choice and Upload and refuses
+anything else with `unsupported_answer_type`, so `forms_provision_workbook` still refuses
+to invent an answer for a required question of a type it cannot fill.
+
+The text question's editor and its "More settings" menu were inspected on 2026-10-27.
+The menu exposed Subtitle, Restrictions and Add branching, with no type-change control.
+This is evidence about that UI, not proof that every private API type conversion is
+impossible. The package continues to refuse type changes rather than risk answer loss.
+
 ## Deletes, and the answer loss that matters
 
 | Request | Result |
@@ -92,19 +165,39 @@ card; it simply sits after the preceding section by order.
 | Workbook identity fields appear on the form only once it exists | `sdxWebUrl`, `sdxWorkbookId`, `xlServerDocId`, `sdxWorkbookFileName`, `sdxWorkbookParentFolder`, `sdxWorkbookOwner` |
 | `GET /formapi/msgraph/v1.0/shares/{u!base64url(whole URL)}/driveItem` | 200 — resolves `driveId`/`id` without a separate Graph sign-in |
 | `GET …/drives/{driveId}/items/{id}/workbook/worksheets` | **403 `OpenWorkbookAccessDenied`** through the browser proxy |
+| `POST …/items/{id}/workbook/createSession` | **403 `OpenWorkbookAccessDenied`** (2026-10-27) |
+| `GET …/drives/{driveId}/items/{id}` | 200 with `name`, `size`, `lastModifiedDateTime`, `eTag`, `@microsoft.graph.downloadUrl` |
+| `GET …/items/{id}/content` | **403 `accessDenied`** |
+| the item's `@microsoft.graph.downloadUrl` | **401** from a browser that has never visited the workbook's SharePoint site; 200 once it has |
+| `GET {site}/_layouts/15/download.aspx?UniqueId={sourcedoc guid}` | **200, the stored XLSX** (2026-10-27) |
 
-So **stored-workbook cell and column counts are not readable browser-only in this
-tenant.** `forms_workbook_status` reports `resolves: true`, leaves `rows`/`columns`/
-`surplus_columns` as `null` with `freshness: "unknown"`, and says so in its warnings rather
-than substituting a fresh export's shape for the stored file's.
+So the Excel REST surface is denied in this tenant, but **the stored file itself is
+readable browser-only**; the earlier conclusion was too pessimistic. The first attempt
+returns a sign-in HTML body; one `goto` of the site root completes SSO silently and the
+retry returns the workbook. `forms_workbook_status` now falls back to that download and
+reports real `rows`/`columns`/`question_columns`/`surplus_columns` with
+`freshness: "stored_file"`, returning to `null` and `"unknown"` only if the file itself
+cannot be fetched.
+
+Two layout facts measured on the stored file, which differ from a fresh export: its first
+header is **`Id`**, not `ID`, and it has **five** metadata columns (no `Last modified
+time`). `read_export` matches the metadata headers case-insensitively for that reason.
+
+**A stored workbook keeps a deleted question's column.** A form with one response and one
+text question was read (`question_columns: 1, surplus_columns: 0`), the question deleted
+behind the gate, and the stored file read again immediately and 45 s later: still six
+columns, now `surplus_columns: 1`. A fresh export of the same form drops the column. So the
+two artefacts disagree after a delete, and only the stored file still carries the answer.
 
 ### Fresh response export (what backups use)
 
 `GET /formapi/DownloadExcelFile.ashx?formid=&timezoneOffset=&__TimezoneId=&minResponseId=&maxResponseId=`
 → 200 with an XLSX body.
 
-- `minResponseId=0` → **403**. It must be a real response id; the backup passes the
-  observed minimum and maximum.
+- `minResponseId=0` returns **403**. The existing 2026-10-05 export-range investigation
+  recorded that IDs 8-11 yielded no rows for `8..11`, while `1..4` exported all four rows:
+  these parameters are a 1-based positional range despite their names. Backups start at 1
+  and cover both the live count and highest response ID, then validate the exported IDs.
 - A same-origin `fetch` from the Forms page works. The UI's "Download a copy" issues the
   same request through a popup that closes itself mid-stream, which cancelled the download
   under Playwright (`Download.save_as: Target page … has been closed`) — one run in three.
@@ -173,9 +266,11 @@ resume rather than writing twice.
 
 - Writing to a **group-owned or shared** form (discovery works; the group write path is untested).
 - The non-empty shape of `sharedWithMeForms`.
-- Question types beyond Text, Choice and file Upload (Rating, Date, Ranking, Likert, NPS, quizzes).
+- Responder answers for Rating, Date, Ranking, Likert and NPS: authoring is measured,
+  filling and submitting them is not, and `forms_fill` refuses them.
+- Authoring Likert (the composite above), quiz questions, and `Ribbon`/`Trophy` rating shapes.
 - Branching forms, and any form whose answers reveal later pages conditionally.
-- Whether a stored, already-synced workbook keeps a deleted question's column — the
-  measurement above is of fresh exports, and the stored file's cells are 403 here.
+- Whether the stored workbook ever drops a deleted question's column later: it still held
+  it 45 s after the delete, and nothing longer than that was observed.
 - Whether the limit in "Rate limiting" below is per minute, per hour or per request type.
 - Any tenant whose Forms UI is not in English: several waits key on `Submit`/`Next` names.

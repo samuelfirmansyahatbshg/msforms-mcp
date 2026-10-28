@@ -8,8 +8,24 @@ TYPES = {
     "Text": "Question.TextField",
     "Choice": "Question.Choice",
     "Upload": "Question.FileUpload",
+    "Rating": "Question.Rating",
+    "Date": "Question.DateTime",
+    "Ranking": "Question.Ranking",
+    "NPS": "Question.NPS",
     "Section": "Question.ColumnGroup",
 }
+
+# Measured 2026-10-27: the designer writes RatingShape as its UI label without spaces.
+SHAPES = {
+    "Star",
+    "Number",
+    "Heart",
+    "ThumbLike",
+    "SmileFace",
+    "Flag",
+    "Lightbulb",
+}
+OPTION_TYPES = {"Choice", "Ranking"}
 
 
 def validate_spec(document: list | dict) -> list[dict]:
@@ -28,7 +44,24 @@ def validate_spec(document: list | dict) -> list[dict]:
                 "Replace opts_from with an explicit opts array; no external modules are imported.",
             )
         section = "s" in c
-        allowed = {"s"} if section else {"k", "t", "q", "req", "num", "long", "opts", "mb"}
+        allowed = (
+            {"s"}
+            if section
+            else {
+                "k",
+                "t",
+                "q",
+                "req",
+                "num",
+                "long",
+                "opts",
+                "mb",
+                "levels",
+                "shape",
+                "left",
+                "right",
+            }
+        )
         if set(c) - allowed:
             raise FormsError(
                 "invalid_spec",
@@ -45,16 +78,20 @@ def validate_spec(document: list | dict) -> list[dict]:
             )
         c["s" if section else "q"] = title.strip()
         if not section:
-            if c.get("t") not in {"Text", "Choice", "Upload"}:
+            kind = c.get("t")
+            if not isinstance(kind, str) or kind not in TYPES or kind == "Section":
                 raise FormsError(
-                    "invalid_spec", "Supported question types are Text, Choice and Upload."
+                    "invalid_spec",
+                    "Supported question types are "
+                    + ", ".join(t for t in TYPES if t != "Section")
+                    + ".",
                 )
             for flag in ("req", "num", "long"):
                 if flag in c and type(c[flag]) is not bool:
                     raise FormsError("invalid_spec", f"{flag} must be a boolean.")
-            if c["t"] != "Text" and any(k in c for k in ("num", "long")):
+            if kind != "Text" and any(k in c for k in ("num", "long")):
                 raise FormsError("invalid_spec", "num and long apply only to Text.")
-            if c["t"] == "Choice":
+            if kind in OPTION_TYPES:
                 if (
                     not isinstance(c.get("opts"), list)
                     or not c["opts"]
@@ -62,12 +99,32 @@ def validate_spec(document: list | dict) -> list[dict]:
                     or len(set(c["opts"])) != len(c["opts"])
                 ):
                     raise FormsError(
-                        "invalid_spec", "Choice requires distinct nonempty opts strings."
+                        "invalid_spec", f"{kind} requires distinct nonempty opts strings."
                     )
             elif "opts" in c:
-                raise FormsError("invalid_spec", "opts applies only to Choice.")
-            if "mb" in c and (c["t"] != "Upload" or type(c["mb"]) is not int or c["mb"] <= 0):
+                raise FormsError("invalid_spec", "opts applies only to Choice and Ranking.")
+            if "mb" in c and (kind != "Upload" or type(c["mb"]) is not int or c["mb"] <= 0):
                 raise FormsError("invalid_spec", "mb must be a positive integer on Upload.")
+            if kind == "Rating":
+                levels = c.get("levels", 5)
+                if type(levels) is not int or not 2 <= levels <= 10:
+                    raise FormsError(
+                        "invalid_spec", "Rating levels must be an integer from 2 to 10."
+                    )
+                if (
+                    not isinstance(c.get("shape", "Star"), str)
+                    or c.get("shape", "Star") not in SHAPES
+                ):
+                    raise FormsError(
+                        "invalid_spec", "shape must be one of " + ", ".join(sorted(SHAPES)) + "."
+                    )
+            elif any(k in c for k in ("levels", "shape")):
+                raise FormsError("invalid_spec", "levels and shape apply only to Rating.")
+            if kind in {"Rating", "NPS"}:
+                if any(k in c and not isinstance(c[k], str) for k in ("left", "right")):
+                    raise FormsError("invalid_spec", "left and right must be strings.")
+            elif any(k in c for k in ("left", "right")):
+                raise FormsError("invalid_spec", "left and right apply only to Rating and NPS.")
             if "k" in c:
                 if not isinstance(c["k"], str) or not c["k"] or c["k"] in keys:
                     raise FormsError("invalid_spec", "Canonical keys must be nonempty and unique.")

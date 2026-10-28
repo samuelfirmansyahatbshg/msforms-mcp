@@ -9,6 +9,7 @@ import pytest
 
 from forms_mcp.api import FormsAPI
 from forms_mcp.fill import Responses
+from forms_mcp.fleet import Fleet
 from forms_mcp.operations import patch_question
 from forms_mcp.safety import delete
 from forms_mcp.session import BrowserSession
@@ -43,6 +44,17 @@ async def test_disposable_full_chain(tmp_path):
             {"s": "Test"},
             {"t": "Text", "q": "Synthetic text", "req": True},
             {"t": "Choice", "q": "Synthetic choice", "opts": ["Yes", "No"], "req": True},
+            {
+                "t": "Rating",
+                "q": "Synthetic rating",
+                "levels": 10,
+                "shape": "Number",
+                "left": "Low",
+                "right": "High",
+            },
+            {"t": "Date", "q": "Synthetic date"},
+            {"t": "Ranking", "q": "Synthetic ranking", "opts": ["Alpha", "Beta", "Gamma"]},
+            {"t": "NPS", "q": "Synthetic score"},
         ]
         assert (await api.build(fid, spec))["status"] == "completed"
         assert (await api.verify(fid, spec))["matches"]
@@ -50,6 +62,27 @@ async def test_disposable_full_chain(tmp_path):
         qid = next(c["id"] for c in form["questions"] if c["title"] == "Synthetic text")
         assert (await patch_question(api, fid, qid, {"Multiline": False}))["status"] == "completed"
         spec[1]["long"] = False
+        ranking = next(c["id"] for c in form["questions"] if c["title"] == "Synthetic ranking")
+        fleet = Fleet(api, books, tmp_path)
+        changed = ["Beta", "Alpha", "Delta", "Epsilon"]
+        plan = await fleet.plan(
+            {"ids": [fid]},
+            [{"action": "patch", "title": "Synthetic ranking", "changes": {"options": changed}}],
+        )
+        assert (await fleet.apply(plan["plan_id"], confirm_disposable))["status"] == "completed"
+        assert (await fleet.apply(plan["plan_id"], confirm_disposable))["results"][0][
+            "status"
+        ] == "already_applied"
+        changed = changed[:2]
+        assert (await patch_question(api, fid, ranking, {"options": changed}))[
+            "status"
+        ] == "completed"
+        spec[5]["opts"] = changed
+        rating = next(c["id"] for c in form["questions"] if c["title"] == "Synthetic rating")
+        assert (await patch_question(api, fid, rating, {"levels": 7, "shape": "SmileFace"}))[
+            "status"
+        ] == "completed"
+        spec[3].update(levels=7, shape="SmileFace")
         assert (await api.build(fid, spec))["status"] == "already_applied"
         form = await api.read(fid)
         draft = await responder.fill(fid, responder.synthetic_answers(form))
@@ -63,14 +96,16 @@ async def test_disposable_full_chain(tmp_path):
         assert (await books.provision(fid))["status"] == "completed"
         status = await books.status(fid)
         assert status["associated"] and status["resolves"]
-        if status["freshness"] == "unknown":
+        if status["freshness"] == "stored_file":
+            assert status["question_columns"] == len(spec) - 1
+        elif status["freshness"] == "unknown":
             assert status["columns"] is None and status["warnings"]
         backup = await books.export(fid)
         assert backup["row_count"] == 1 and Path(backup["path"]).is_file()
         removed = await delete(api, books, confirm_disposable, fid, qid)
         assert removed["deleted"] and removed["backup"]["row_count"] == 1
         remaining = await books.export(fid)
-        assert remaining["question_columns"] == 1
+        assert remaining["question_columns"] == len(spec) - 2
         assert (await delete(api, books, confirm_disposable, fid))["deleted"]
     finally:
         # On failure preserve the registered disposable form and backups for diagnosis.

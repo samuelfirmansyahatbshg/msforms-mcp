@@ -124,7 +124,7 @@ def create_server(profile=None, channel=None, state_dir=None):
 
     @server.tool(annotations=write)
     async def forms_add_question(form_id: str, question: dict) -> dict:
-        """Append one question using t,q,req,num,long,opts,mb spec fields. Workbook columns may await another response."""
+        """Append one question using t,q,req,num,long,opts,mb,levels,shape,left,right spec fields. Workbook columns may await another response."""
 
         async def operation():
             if "s" in question:
@@ -140,7 +140,7 @@ def create_server(profile=None, channel=None, state_dir=None):
 
     @server.tool(annotations=patch)
     async def forms_patch_question(form_id: str, question_id: str, changes: dict) -> dict:
-        """Patch title, required, options, Multiline or max_file_size_mb in place. Type changes are refused."""
+        """Patch title, required, options, Multiline, max_file_size_mb, levels, shape or left/right labels in place. Type changes are refused."""
         return await execute(lambda: patch_question(api, form_id, question_id, changes), form_id)
 
     @server.tool(annotations=write)

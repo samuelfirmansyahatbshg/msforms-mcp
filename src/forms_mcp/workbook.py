@@ -4,9 +4,11 @@ import base64
 import hashlib
 import io
 import json
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from openpyxl import load_workbook
@@ -16,7 +18,7 @@ from .ids import ORIGIN, api_root
 
 EXPORT_JS = """async ({formId, minId, maxId}) => {
  const url = new URL('/formapi/DownloadExcelFile.ashx', location.origin);
- // Measured: minResponseId must be a real response id; 0 is rejected with 403.
+ // Measured: this is a 1-based row range despite the parameter names; 0 returns 403.
  url.search = new URLSearchParams({formid:formId, timezoneOffset:'0', __TimezoneId:'UTC',
    minResponseId:String(minId), maxResponseId:String(maxId)});
  const r = await fetch(url, {credentials:'same-origin', headers:{
@@ -73,7 +75,13 @@ def read_export(content):
     if not rows:
         raise FormsError("empty_export", "Response export has no header.")
     headers = list(rows[0])
-    if headers[:5] != ["ID", "Start time", "Completion time", "Email", "Name"]:
+    if [str(h).strip().lower() for h in headers[:5]] != [
+        "id",
+        "start time",
+        "completion time",
+        "email",
+        "name",
+    ]:
         raise FormsError(
             "unknown_export_layout",
             "Unrecognized response metadata headers; cannot validate backup.",
@@ -103,13 +111,24 @@ class Workbooks:
         The UI's own "Download a copy" issues this same same-origin GET, but routes it
         through a popup whose lifetime Playwright ties the artifact to — a popup that
         closes itself mid-stream, cancelling the download. Fetching the request directly
-        removes that race. Measured: minResponseId must be a real id; 0 returns 403.
+        removes that race.
+
+        Measured 2026-10-05: despite the names, min/maxResponseId are a 1-BASED POSITIONAL
+        row range, not response ids. On a form whose four responses carry ids 8-11, `8..11`
+        exported zero rows while `1..4` and `1..11` both returned all four. 0 returns 403.
+        So the range starts at 1, and the upper bound covers the row count and the highest
+        id, which is correct under either reading. The caller validates the result against
+        the live form regardless.
         """
         if not response_ids:
             raise FormsError("no_responses", "There are no responses to export.")
         result = await self.api.session.page.evaluate(
             EXPORT_JS,
-            {"formId": form_id, "minId": min(response_ids), "maxId": max(response_ids)},
+            {
+                "formId": form_id,
+                "minId": 1,
+                "maxId": max(len(response_ids), max(response_ids)),
+            },
         )
         if result["status"] != 200:
             raise FormsError(
@@ -254,10 +273,103 @@ class Workbooks:
                 )
         except FormsError as exc:
             result["warnings"].append(f"{exc.code}: {exc}")
-            result["warnings"].append(
-                "Stored workbook columns remain unknown. A fresh Forms export is not the stored workbook."
-            )
+            try:
+                await self.stored_shape(form_id, raw_url, result, form)
+            except FormsError as fallback:
+                result["warnings"].append(f"{fallback.code}: {fallback}")
+                result["warnings"].append(
+                    "Stored workbook columns remain unknown. A fresh Forms export is not the stored workbook."
+                )
         return result
+
+    async def stored_shape(self, form_id, raw_url, result, form):
+        """Read the stored workbook itself when the Graph workbook API is denied.
+
+        Measured 2026-10-27: `/workbook/worksheets` and `/workbook/createSession` return
+        403 `OpenWorkbookAccessDenied` in this tenant, and the proxy's pre-authenticated
+        `@microsoft.graph.downloadUrl` returns 401 from a session that has never visited
+        SharePoint. The file's own site serves it:
+        `GET {site}/_layouts/15/download.aspx?UniqueId={guid}` returned the 11 KB XLSX once
+        the dedicated browser had loaded that site once (silent SSO, no extra sign-in).
+        The stored sheet's first header is `Id`, not the fresh export's `ID`.
+        """
+        parts = urlsplit(clean_url(raw_url))
+        if (
+            not parts.hostname
+            or not parts.hostname.endswith(".sharepoint.com")
+            or parts.username is not None
+            or parts.password is not None
+            or parts.netloc.lower() != parts.hostname.lower()
+        ):
+            raise FormsError(
+                "unsafe_workbook_url", "Stored downloads require an HTTPS SharePoint site."
+            )
+        unique = (parse_qs(parts.query).get("sourcedoc") or [""])[0].strip("{}")
+        if "/_layouts/" not in parts.path or not re.fullmatch(
+            r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", unique
+        ):
+            raise FormsError("unknown_workbook_url", "Workbook URL carries no document id.")
+        site_path = parts.path.split("/_layouts/")[0]
+        if site_path and not re.fullmatch(r"/(?:personal|sites|teams)/[A-Za-z0-9_%-]+", site_path):
+            raise FormsError("unsafe_workbook_url", "Unrecognized SharePoint site path.")
+        site = f"{parts.scheme}://{parts.netloc}{site_path}"
+        target = f"{site}/_layouts/15/download.aspx?UniqueId={unique}"
+        content = await self.fetch_file(target)
+        if content[:2] != b"PK":
+            # Sign-in HTML instead of the file: establish this site's session once.
+            try:
+                await self.api.session.page.goto(site + "/", wait_until="domcontentloaded")
+            except Exception:
+                raise FormsError(
+                    "workbook_signin_failed", "Could not establish the workbook site's session."
+                ) from None
+            finally:
+                await self.api.session.ready(form_id)
+            content = await self.fetch_file(target)
+        if content[:2] != b"PK":
+            raise FormsError(
+                "stored_workbook_unreadable", "The workbook site did not return the file."
+            )
+        parsed = read_export(content)
+        headers = parsed["headers"][parsed["metadata_columns"] :]
+        live = Counter(c.get("title") for c in form.get("questions", []))
+        stored = Counter(headers)
+        result.update(
+            rows=parsed["row_count"],
+            columns=len(parsed["headers"]),
+            question_columns=parsed["question_columns"],
+            surplus_columns=sum((stored - live).values()),
+            missing_columns=sum((live - stored).values()),
+            freshness="stored_file",
+        )
+        if parsed["row_count"] != form.get("rowCount"):
+            result["warnings"].append(
+                "Workbook rows differ from Forms responses; sync is incomplete."
+            )
+
+    async def fetch_file(self, url):
+        response = None
+        try:
+            # Do not follow an unvalidated cross-origin redirect carrying session credentials.
+            response = await self.api.session.context.request.get(url, max_redirects=0)
+            if response.status != 200:
+                return b""
+            length = response.headers.get("content-length")
+            if length and int(length) > 100 * 1024 * 1024:
+                raise FormsError("workbook_too_large", "Stored workbook exceeds the read limit.")
+            body = await response.body()
+            if len(body) > 100 * 1024 * 1024:
+                raise FormsError("workbook_too_large", "Stored workbook exceeds the read limit.")
+            return body
+        except FormsError:
+            raise
+        except Exception:
+            raise FormsError(
+                "stored_workbook_unreadable", "Could not download the stored workbook."
+            ) from None
+        finally:
+            if response is not None:
+                await response.dispose()
 
     async def provision(self, form_id):
         form = await self.api.read(form_id)

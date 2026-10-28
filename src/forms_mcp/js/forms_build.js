@@ -1,7 +1,8 @@
 // Measured creation protocol adapted from oven-report-generator/scripts/forms_build.js.
 // API requests remain inside the authenticated page. Caller supplies an already validated spec.
 async ({root, formId, spec, dry=false, append=false}) => {
-  const T = {Text:'Question.TextField',Choice:'Question.Choice',Upload:'Question.FileUpload'};
+  const T = {Text:'Question.TextField',Choice:'Question.Choice',Upload:'Question.FileUpload',
+    Rating:'Question.Rating',Date:'Question.DateTime',Ranking:'Question.Ranking',NPS:'Question.NPS'};
   const INFO_TEXT = {Multiline:false,ShuffleOptions:false,ShowRatingLabel:false};
   const INFO_NUMBER = {...INFO_TEXT,Validation:{rule:0},IsNumber:true,NumberValidationRule:'IsNumber'};
   const INFO_CHOICE = {Choices:[],ChoiceType:1,AllowOtherAnswer:false,OptionDisplayStyle:'ListAll',
@@ -9,6 +10,13 @@ async ({root, formId, spec, dry=false, append=false}) => {
   const INFO_UPLOAD = {HasSpecificFileType:false,FileTypes:{Word:true,Excel:true,PowerPoint:true,
     PDF:true,Image:true,Video:true,Audio:true},MaxFileCount:1,MaxFileSize:10,
     ShuffleOptions:false,ShowRatingLabel:false,IsMathQuiz:false};
+  // Measured 2026-10-27 from the designer's own writes; see MEASUREMENTS.md.
+  const INFO_DATE = {Date:true,Time:false,ShuffleOptions:false,IsMathQuiz:false};
+  const INFO_RANKING = {ShuffleOptions:false,ShowRatingLabel:false,IsMathQuiz:false};
+  const infoRating = s => ({Length:s.levels??5,RatingShape:s.shape??'Star',
+    LeftDescription:s.left??'',RightDescription:s.right??'',MinRating:1});
+  const infoNps = s => ({LeftDescription:s.left??'Not at all likely',
+    RightDescription:s.right??'Extremely likely',ShuffleOptions:false,ShowRatingLabel:false,IsMathQuiz:false});
   const pause = () => new Promise(r=>setTimeout(r,120));
   const endpoint = `${root}/forms('${formId}')`;
   const read = async () => {
@@ -49,11 +57,22 @@ async ({root, formId, spec, dry=false, append=false}) => {
     if(s.t==='Text') qi=s.num?INFO_NUMBER:{...INFO_TEXT,Multiline:s.long!==false};
     if(s.t==='Choice') qi={...INFO_CHOICE,Choices:s.opts.map(v=>({Description:v,FormsProDisplayRTText:v}))};
     if(s.t==='Upload') qi=INFO_UPLOAD;
+    if(s.t==='Rating') qi=infoRating(s);
+    if(s.t==='Date') qi=INFO_DATE;
+    if(s.t==='Ranking') qi=INFO_RANKING;
+    if(s.t==='NPS') qi=infoNps(s);
     try {
       await write('POST','/'+collection,{id,order,type:s.s?'Question.ColumnGroup':T[s.t],
-        title:s.s?'Section':'Question',isQuiz:false,required:!s.s,...(qi?{questionInfo:JSON.stringify(qi)}:{})});
+        title:s.s?'Section':'Question',isQuiz:false,required:!s.s,
+        ...(s.t==='Ranking'?{allowMultipleValues:true}:{}),
+        ...(qi?{questionInfo:JSON.stringify(qi)}:{})});
       await write('PATCH',`/${collection}('${id}')`,{title,formsProRTQuestionTitle:title});
       if(!s.s&&!s.req) await write('PATCH',`/${collection}('${id}')`,{required:false});
+      // Ranking options are a sub-collection: one POST per option, server-assigned ids.
+      if(s.t==='Ranking') for(let n=0;n<s.opts.length;n++)
+        await write('POST',`/questions('${id}')/choices`,{displayText:s.opts[n],order:n+1,
+          description:null,key:crypto.randomUUID(),
+          customProperties:JSON.stringify({FormsProDisplayRTText:s.opts[n]})});
       if(s.t==='Upload'&&s.mb&&s.mb!==10) {
         try { await write('PATCH',`/${collection}('${id}')`,{questionInfo:JSON.stringify({...INFO_UPLOAD,MaxFileSize:s.mb})}); }
         catch(e) { result.warnings.push({id,reason:'file_size_patch_failed'}); }

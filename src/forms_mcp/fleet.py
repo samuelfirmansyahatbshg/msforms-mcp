@@ -10,7 +10,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from .errors import FormsError
-from .operations import cards, desired_matches, patch_payload
+from .operations import (
+    CHOICE_SUBCOLLECTION,
+    card_options,
+    cards,
+    desired_matches,
+    patch_payload,
+    patch_question,
+)
 from .safety import fingerprint, response_count
 
 
@@ -57,13 +64,31 @@ def plan_form(form, edits):
             "payload": payload,
         }
         if payload is not None:
-            if desired_matches(card, payload):
+            suboptions = (
+                edit["changes"].get("options") if card["type"] in CHOICE_SUBCOLLECTION else None
+            )
+            if desired_matches(card, payload) and (
+                suboptions is None or card_options(card) == suboptions
+            ):
                 operation["status"] = "already_applied"
             card.update(payload)
+            if suboptions is not None:
+                operation["changes"] = deepcopy(edit["changes"])
+                card["choices"] = [
+                    {"displayText": text, "order": index}
+                    for index, text in enumerate(suboptions, 1)
+                ]
             operation["after"] = deepcopy(card)
         else:
             collection = "descriptiveQuestions" if section else "questions"
-            state[collection] = [c for c in state[collection] if c["id"] != card["id"]]
+            state[collection] = [
+                c
+                for c in state[collection]
+                if c["id"] != card["id"]
+                and not (
+                    card["type"] == "Question.MatrixChoiceGroup" and c.get("groupId") == card["id"]
+                )
+            ]
             operation["after"] = None
         operations.append(operation)
     deletions = [op for op in operations if op.get("action") == "delete"]
@@ -263,22 +288,37 @@ class Fleet:
                     collection = "descriptiveQuestions" if op["section"] else "questions"
                     if op["action"] == "delete":
                         predicted[collection] = [
-                            c for c in predicted[collection] if c["id"] != op["card_id"]
+                            c
+                            for c in predicted[collection]
+                            if c["id"] != op["card_id"]
+                            and not (
+                                op["before"]["type"] == "Question.MatrixChoiceGroup"
+                                and c.get("groupId") == op["card_id"]
+                            )
                         ]
                     else:
-                        next(c for c in predicted[collection] if c["id"] == op["card_id"]).update(
-                            op["payload"]
-                        )
+                        predicted[collection] = [
+                            deepcopy(op["after"]) if c["id"] == op["card_id"] else c
+                            for c in predicted[collection]
+                        ]
                     progress["pending"] = {
                         "index": index,
                         "after_fingerprint": fingerprint(predicted),
                     }
                     self._save(journal)
-                    await self.api.request(
-                        "DELETE" if op["action"] == "delete" else "PATCH",
-                        self.api.card_path(fid, op["card_id"], op["section"]),
-                        op["payload"],
-                    )
+                    if "changes" in op:
+                        outcome = await patch_question(self.api, fid, op["card_id"], op["changes"])
+                        if outcome["status"] not in ("completed", "already_applied"):
+                            raise FormsError(
+                                "verification_failed",
+                                "Choice edits differ from the planned result.",
+                            )
+                    else:
+                        await self.api.request(
+                            "DELETE" if op["action"] == "delete" else "PATCH",
+                            self.api.card_path(fid, op["card_id"], op["section"]),
+                            op["payload"],
+                        )
                     after = await self.api.read(fid)
                     if fingerprint(after) != fingerprint(predicted):
                         raise FormsError(

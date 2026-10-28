@@ -1,13 +1,16 @@
 import json
 import math
 from copy import deepcopy
+from uuid import uuid4
 
 from .api import script
 from .errors import FormsError
 from .ids import api_root
-from .spec import validate_spec
+from .spec import SHAPES, validate_spec
 
 MOVE_WARNING = "Display order may diverge from workbook creation order. Whole order values do not prove column alignment."
+# Measured: these two keep their options in a choices sub-collection, not in questionInfo.
+CHOICE_SUBCOLLECTION = {"Question.Ranking", "Question.MatrixChoiceGroup"}
 
 
 def cards(form):
@@ -32,11 +35,21 @@ def patch_payload(card, changes):
             "type_change_refused",
             "Forms cannot change a question's type. Delete/recreate destroys historical answers and is never implicit.",
         )
-    allowed = {"title", "required", "options", "Multiline", "max_file_size_mb"}
+    allowed = {
+        "title",
+        "required",
+        "options",
+        "Multiline",
+        "max_file_size_mb",
+        "levels",
+        "shape",
+        "left",
+        "right",
+    }
     if not changes or set(changes) - allowed:
         raise FormsError(
             "invalid_patch",
-            "Allowed changes: title, required, options, Multiline, max_file_size_mb.",
+            "Allowed changes: " + ", ".join(sorted(allowed)) + ".",
         )
     result = {}
     if "title" in changes:
@@ -48,22 +61,27 @@ def patch_payload(card, changes):
         if type(changes["required"]) is not bool or card["type"] == "Question.ColumnGroup":
             raise FormsError("invalid_patch", "required must be a boolean on a question.")
         result["required"] = changes["required"]
-    if set(changes) & {"options", "Multiline", "max_file_size_mb"}:
+    if set(changes) & (allowed - {"title", "required"}):
         try:
             info = json.loads(card.get("questionInfo") or "{}")
         except (TypeError, ValueError):
             raise FormsError("malformed_info", "Cannot preserve malformed questionInfo.") from None
         if not isinstance(info, dict):
             raise FormsError("malformed_info", "questionInfo must contain a JSON object.")
+        before = deepcopy(info)
         if "options" in changes:
             values = changes["options"]
             validate_spec([{"t": "Choice", "q": "Validation", "opts": values}])
-            if card["type"] != "Question.Choice":
-                raise FormsError("invalid_patch", "options applies only to Choice.")
-            old = {c["Description"]: c for c in info.get("Choices", [])}
-            info["Choices"] = [
-                deepcopy(old.get(v, {"Description": v, "FormsProDisplayRTText": v})) for v in values
-            ]
+            if card["type"] == "Question.Choice":
+                old = {c["Description"]: c for c in info.get("Choices", [])}
+                info["Choices"] = [
+                    deepcopy(old.get(v, {"Description": v, "FormsProDisplayRTText": v}))
+                    for v in values
+                ]
+            elif card["type"] not in CHOICE_SUBCOLLECTION:
+                raise FormsError(
+                    "invalid_patch", "options applies only to Choice, Ranking and Likert."
+                )
         if "Multiline" in changes:
             if (
                 type(changes["Multiline"]) is not bool
@@ -81,8 +99,77 @@ def patch_payload(card, changes):
                     "invalid_patch", "max_file_size_mb must be a positive integer on Upload."
                 )
             info["MaxFileSize"] = size
-        result["questionInfo"] = json.dumps(info, separators=(",", ":"))
+        if "levels" in changes or "shape" in changes:
+            if card["type"] != "Question.Rating":
+                raise FormsError("invalid_patch", "levels and shape apply only to Rating.")
+            if "levels" in changes:
+                levels = changes["levels"]
+                if type(levels) is not int or not 2 <= levels <= 10:
+                    raise FormsError("invalid_patch", "levels must be an integer from 2 to 10.")
+                info["Length"] = levels
+            if "shape" in changes:
+                if not isinstance(changes["shape"], str) or changes["shape"] not in SHAPES:
+                    raise FormsError(
+                        "invalid_patch", "shape must be one of " + ", ".join(sorted(SHAPES)) + "."
+                    )
+                info["RatingShape"] = changes["shape"]
+        for key, field in (("left", "LeftDescription"), ("right", "RightDescription")):
+            if key in changes:
+                if card["type"] not in ("Question.Rating", "Question.NPS") or not isinstance(
+                    changes[key], str
+                ):
+                    raise FormsError(
+                        "invalid_patch", "left and right are strings on Rating and NPS."
+                    )
+                info[field] = changes[key]
+        if info != before:
+            result["questionInfo"] = json.dumps(info, separators=(",", ":"))
     return result
+
+
+def choice_ops(card, values):
+    """Measured: Ranking and Likert options live in a choices sub-collection, not questionInfo.
+
+    POST assigns the id, PATCH edits one by integer id, DELETE removes it, all 2026-10-27.
+    """
+    existing = sorted(card.get("choices") or [], key=lambda c: c.get("order") or 0)
+    if any(type(c.get("id")) is not int for c in existing):
+        raise FormsError("unknown_choice_shape", "Choice ids are not integers; refusing to patch.")
+    order = max([c.get("order") or 0 for c in existing] + [0])
+    ops = []
+    for index, text in enumerate(values):
+        body = {
+            "displayText": text,
+            "customProperties": json.dumps({"FormsProDisplayRTText": text}, separators=(",", ":")),
+        }
+        if index < len(existing):
+            if existing[index].get("displayText") != text:
+                ops.append(("PATCH", f"/choices({existing[index]['id']})", body))
+        else:
+            order += 1
+            ops.append(
+                (
+                    "POST",
+                    "/choices",
+                    {**body, "order": order, "description": None, "key": str(uuid4())},
+                )
+            )
+    for surplus in existing[len(values) :]:
+        ops.append(("DELETE", f"/choices({surplus['id']})", None))
+    return ops
+
+
+def card_options(card):
+    if card.get("type") == "Question.Choice":
+        try:
+            info = json.loads(card.get("questionInfo") or "{}")
+        except (TypeError, ValueError):
+            return []
+        return [c.get("Description") for c in info.get("Choices", [])]
+    return [
+        c.get("displayText")
+        for c in sorted(card.get("choices") or [], key=lambda c: c.get("order") or 0)
+    ]
 
 
 def desired_matches(card, payload):
@@ -98,14 +185,24 @@ async def patch_question(api, form_id, card_id, changes):
     form = await api.read(form_id)
     card = find_card(form, card_id)
     payload = patch_payload(card, changes)
-    if desired_matches(card, payload):
-        return {"status": "already_applied", "id": card_id}
-    await api.request(
-        "PATCH", api.card_path(form_id, card_id, card["type"] == "Question.ColumnGroup"), payload
+    ops = (
+        choice_ops(card, changes["options"])
+        if "options" in changes and card["type"] in CHOICE_SUBCOLLECTION
+        else []
     )
+    if desired_matches(card, payload) and not ops:
+        return {"status": "already_applied", "id": card_id}
+    path = api.card_path(form_id, card_id, card["type"] == "Question.ColumnGroup")
+    if payload:
+        await api.request("PATCH", path, payload)
+    for method, suffix, body in ops:
+        await api.request(method, path + suffix, body)
     after = find_card(await api.read(form_id), card_id)
+    applied = desired_matches(after, payload) and (
+        not ops or card_options(after) == changes["options"]
+    )
     return {
-        "status": "completed" if desired_matches(after, payload) else "verification_failed",
+        "status": "completed" if applied else "verification_failed",
         "id": card_id,
     }
 
